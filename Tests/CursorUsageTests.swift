@@ -104,6 +104,17 @@ final class CursorCredentialsTests: XCTestCase {
             }
         }
     }
+
+    func testSubjectIsReadFromTheAccessTokenJWT() {
+        // {"sub":"auth0|user_ABC","aud":"https://cursor.com"}
+        let payload = Data(#"{"sub":"auth0|user_ABC","aud":"https://cursor.com"}"#.utf8)
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "="))
+        let jwt = "hdr.\(payload).sig"
+        XCTAssertEqual(CursorCredentials.subject(fromJWT: jwt), "auth0|user_ABC")
+    }
 }
 
 /// Confirmed against a real account switched mid-cycle: Cursor reports 0% and
@@ -132,5 +143,43 @@ final class CursorZeroUsageTests: XCTestCase {
                                                  with: "\"totalPercentUsed\":34")
         let windows = try CursorUsage.windows(fromJSON: used)
         XCTAssertEqual(windows.first?.usedFraction ?? 0, 0.34, accuracy: 0.0001)
+    }
+}
+
+
+/// Enterprise / team plans omit `plan.totalPercentUsed` and meter a hard
+/// `overall` ceiling instead. Verbatim shape from a live enterprise account.
+final class CursorEnterpriseUsageTests: XCTestCase {
+    private let recorded = """
+    {"billingCycleStart":"2026-09-01T00:00:00.000Z",
+     "billingCycleEnd":"2026-10-01T00:00:00.000Z",
+     "membershipType":"enterprise","limitType":"team","isUnlimited":false,
+     "autoModelSelectedDisplayMessage":"You've used 0% of your included total usage",
+     "namedModelSelectedDisplayMessage":"You've used 0% of your included API usage",
+     "individualUsage":{
+       "overall":{"enabled":true,"used":6907,"limit":45000,"remaining":38093}},
+     "teamUsage":{
+       "onDemand":{"enabled":true,"used":0,"limit":1000000,"remaining":1000000}}}
+    """
+
+    func testOverallCeilingIsTheIncludedWindow() throws {
+        let windows = try CursorUsage.windows(fromJSON: recorded)
+        XCTAssertEqual(windows.map(\.id), ["included"])
+        XCTAssertEqual(windows[0].label, "Included usage")
+        XCTAssertEqual(windows[0].usedFraction ?? -1, 6907.0 / 45000.0, accuracy: 0.0001)
+    }
+
+    func testUnusedTeamOnDemandIsOmitted() throws {
+        let windows = try CursorUsage.windows(fromJSON: recorded)
+        XCTAssertFalse(windows.contains { $0.id == "team_on_demand" })
+    }
+
+    func testTeamOnDemandAppearsOnceTouched() throws {
+        let touched = recorded.replacingOccurrences(
+            of: #""onDemand":{"enabled":true,"used":0,"limit":1000000,"remaining":1000000}"#,
+            with: #""onDemand":{"enabled":true,"used":250000,"limit":1000000,"remaining":750000}"#)
+        let windows = try CursorUsage.windows(fromJSON: touched)
+        XCTAssertEqual(windows.map(\.id), ["included", "team_on_demand"])
+        XCTAssertEqual(windows[1].usedFraction ?? -1, 0.25, accuracy: 0.0001)
     }
 }

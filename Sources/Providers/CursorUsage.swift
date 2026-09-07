@@ -14,12 +14,25 @@ import Foundation
 ///     "onDemand": { "enabled": false, "used": 0, "limit": null } } }
 /// ```
 ///
+/// Enterprise / team plans ship a different shape — no `plan` percentages,
+/// just a hard `overall` ceiling:
+///
+/// ```json
+/// { "membershipType": "enterprise", "limitType": "team",
+///   "individualUsage": {
+///     "overall": { "enabled": true, "used": 6907, "limit": 45000, "remaining": 38093 } },
+///   "teamUsage": {
+///     "onDemand": { "enabled": true, "used": 0, "limit": 1000000 } } }
+/// ```
+///
 /// Cursor meters an **allowance, not a request count** — the dashboard's "Your
 /// included usage · N% used" is `totalPercentUsed`. The `used`/`limit` pair sits
 /// at zero on a free plan even while real usage is happening, because the
 /// allowance arrives as `breakdown.bonus` rather than as a dollar limit. Reading
 /// `used`/`limit` therefore reports 0% for an account that is 10% through its
-/// month, which is exactly what this parser used to do.
+/// month, which is exactly what this parser used to do. Enterprise is the
+/// opposite: there is no percentage field, so `used`/`limit` on `overall` is
+/// the reading.
 enum CursorUsage {
     static func windows(fromJSON json: String) throws -> [LimitWindow] {
         guard let data = json.data(using: .utf8),
@@ -29,6 +42,7 @@ enum CursorUsage {
         let resetsAt = date(root["billingCycleEnd"])
         let usage = root["individualUsage"] as? [String: Any] ?? [:]
         let plan = usage["plan"] as? [String: Any] ?? [:]
+        let team = root["teamUsage"] as? [String: Any] ?? [:]
 
         var windows: [LimitWindow] = []
 
@@ -53,6 +67,20 @@ enum CursorUsage {
         if let onDemand = spendWindow(usage["onDemand"], id: "on_demand",
                                       label: "On demand", resetsAt: resetsAt) {
             windows.append(onDemand)
+        }
+
+        // Enterprise / team plans omit `plan` entirely and meter a hard
+        // `overall` ceiling instead. Keep the window id as `included` so the
+        // provider's headlineID still resolves.
+        if windows.isEmpty,
+           let overall = spendWindow(usage["overall"], id: "included",
+                                     label: "Included usage", resetsAt: resetsAt) {
+            windows.append(overall)
+        }
+        if let teamOnDemand = spendWindow(team["onDemand"], id: "team_on_demand",
+                                          label: "Team on demand", resetsAt: resetsAt),
+           (teamOnDemand.usedFraction ?? 0) > 0 {
+            windows.append(teamOnDemand)
         }
 
         guard windows.isEmpty else { return windows }

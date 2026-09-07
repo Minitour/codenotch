@@ -55,15 +55,40 @@ struct CursorCredentials {
         defer { sqlite3_close(db) }
 
         guard let token = value(forKey: "cursorAuth/accessToken", in: db),
-              let account = value(forKey: "cursorAuth/stripeMembershipAuthId", in: db),
-              !token.isEmpty, !account.isEmpty
+              !token.isEmpty
         else { throw UsageProviderError.needsAuth }
 
+        // Prefer the editor's cached WorkOS id when present. Recent Cursor
+        // builds (Auth0 / enterprise in particular) often omit
+        // `stripeMembershipAuthId` even while signed in — the JWT `sub` is the
+        // same value the cookie needs, so fall back to it rather than telling
+        // the user to sign in again.
+        let account = value(forKey: "cursorAuth/stripeMembershipAuthId", in: db)
+            .flatMap { $0.isEmpty ? nil : $0 }
+            ?? subject(fromJWT: token)
+        guard let account, !account.isEmpty else { throw UsageProviderError.needsAuth }
+
         return CursorCredentials(accountID: account, accessToken: token)
+    }
+
+    /// `sub` claim from an unsigned JWT payload — Cursor's access token is a
+    /// standard three-part JWT whose subject is the WorkOS / Auth0 user id.
+    static func subject(fromJWT token: String) -> String? {
+        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count >= 2 else { return nil }
+        var base64 = parts[1]
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        while base64.count % 4 != 0 { base64.append("=") }
+        guard let data = Data(base64Encoded: base64),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let sub = json["sub"] as? String,
+              !sub.isEmpty
+        else { return nil }
+        return sub
     }
 
     private static func value(forKey key: String, in db: OpaquePointer?) -> String? {
         SQLiteStore.rows(in: db, sql: "SELECT value FROM ItemTable WHERE key = ?", bind: key).first
     }
 }
-
